@@ -283,6 +283,7 @@ def export_json_bytes(df: pd.DataFrame) -> bytes:
     return df.to_json(orient="records", force_ascii=False, indent=2).encode("utf-8")
 
 
+@st.cache_data(show_spinner=False)
 def build_interactive_html_report(
     all_df: pd.DataFrame,
     transfers: pd.DataFrame,
@@ -362,6 +363,7 @@ body{{margin:0;background:#f4f7fb;color:#172137;font-family:Inter,Segoe UI,Arial
     return html.encode("utf-8")
 
 
+@st.cache_data(show_spinner=False)
 def build_executive_excel(all_df: pd.DataFrame, snapshot_label: str, score: int) -> bytes:
     """Excel Gerencial: solo indicadores y acciones, sin columnas técnicas.
     Pensado para enviarse directo a dirección, sin necesidad de filtrar."""
@@ -425,6 +427,7 @@ def build_executive_excel(all_df: pd.DataFrame, snapshot_label: str, score: int)
     return out.getvalue()
 
 
+@st.cache_data(show_spinner=False)
 def build_executive_pdf(all_df: pd.DataFrame, transfers: pd.DataFrame, snapshot_label: str, score: int) -> bytes | None:
     """PDF ejecutivo de una página, listo para enviar por WhatsApp o correo.
     Requiere fpdf2 (pip install fpdf2); si no está instalado, retorna None
@@ -503,6 +506,7 @@ NEXUS v{APP_VERSION} · datos base persistidos en SQLite · recálculo dinámico
     return text.encode("utf-8")
 
 
+@st.cache_data(show_spinner=False)
 def export_bundle(
     excel_bytes: bytes,
     all_df: pd.DataFrame,
@@ -1156,29 +1160,45 @@ def apply_redistribution_to_results(
     site_results: dict[str, pd.DataFrame],
     transfers: pd.DataFrame,
 ) -> dict[str, pd.DataFrame]:
+    """Versión vectorizada: en vez de recorrer cada SKU con iterrows()
+    (lento con catálogos grandes), se agregan las transferencias con
+    groupby + merge, y las columnas se calculan de una sola vez con
+    operaciones de pandas sobre el DataFrame completo."""
     out = {site: df.copy() for site, df in site_results.items()}
     if transfers.empty:
+        for site, df in out.items():
+            df["Transferencias Recibidas"] = 0
+            df["Transferencias Enviadas"] = 0
+            df["Compra Ajustada"] = df["Compra Sugerida"]
         return out
 
-    received: dict[tuple[str, str], int] = {}
-    sent: dict[tuple[str, str], int] = {}
-    for _, row in transfers.iterrows():
-        qty = int(row["Unidades Sugeridas"])
-        received[(row["Destino"], row["Código"])] = received.get((row["Destino"], row["Código"]), 0) + qty
-        sent[(row["Origen"], row["Código"])] = sent.get((row["Origen"], row["Código"]), 0) + qty
+    received = (
+        transfers.groupby(["Destino", "Código"])["Unidades Sugeridas"]
+        .sum().rename("Transferencias Recibidas").reset_index()
+        .rename(columns={"Destino": "Sede"})
+    )
+    sent = (
+        transfers.groupby(["Origen", "Código"])["Unidades Sugeridas"]
+        .sum().rename("Transferencias Enviadas").reset_index()
+        .rename(columns={"Origen": "Sede"})
+    )
 
     for site, df in out.items():
-        for idx, row in df.iterrows():
-            code = row["Código"]
-            rec = received.get((site, code), 0)
-            snd = sent.get((site, code), 0)
-            df.at[idx, "Transferencias Recibidas"] = rec
-            df.at[idx, "Transferencias Enviadas"] = snd
-            df.at[idx, "Compra Ajustada"] = max(int(row["Compra Sugerida"]) - rec, 0)
-            if rec > 0 and int(row["Compra Sugerida"]) > 0:
-                df.at[idx, "Acción"] = "TRANSFERIR DESDE OTRA SEDE"
-            if snd > 0 and int(row["Retiro Almacén"]) > 0:
-                df.at[idx, "Acción"] = "TRANSFERIR A OTRA SEDE"
+        df.drop(columns=["Transferencias Recibidas", "Transferencias Enviadas"], errors="ignore", inplace=True)
+        df = df.merge(received[received["Sede"] == site][["Código", "Transferencias Recibidas"]], on="Código", how="left")
+        df = df.merge(sent[sent["Sede"] == site][["Código", "Transferencias Enviadas"]], on="Código", how="left")
+        df["Transferencias Recibidas"] = df["Transferencias Recibidas"].fillna(0).astype(int)
+        df["Transferencias Enviadas"] = df["Transferencias Enviadas"].fillna(0).astype(int)
+        df["Compra Ajustada"] = (df["Compra Sugerida"] - df["Transferencias Recibidas"]).clip(lower=0)
+
+        recibe_y_compraba = (df["Transferencias Recibidas"] > 0) & (df["Compra Sugerida"] > 0)
+        envia_y_retiraba = (df["Transferencias Enviadas"] > 0) & (df["Retiro Almacén"] > 0)
+        df["Acción"] = np.select(
+            [recibe_y_compraba, envia_y_retiraba],
+            ["TRANSFERIR DESDE OTRA SEDE", "TRANSFERIR A OTRA SEDE"],
+            default=df["Acción"],
+        )
+        out[site] = df
     return out
 
 
@@ -1223,41 +1243,63 @@ def health_label(score: int) -> str:
 
 
 def build_alerts(df: pd.DataFrame) -> pd.DataFrame:
+    """Versión vectorizada: en vez de recorrer fila por fila con
+    iterrows() (muy lento con catálogos grandes), se arma cada tipo de
+    alerta con una máscara booleana sobre todo el DataFrame a la vez."""
     if df.empty:
         return pd.DataFrame(columns=["Tipo", "Severidad", "Sede", "Código", "Descripción", "Detalle"])
-    alerts = []
-    for _, row in df.iterrows():
-        if row["Estado"] == "CRÍTICO — SALDO NEGATIVO":
-            alerts.append({
-                "Tipo": "Saldo negativo", "Severidad": "CRÍTICA", "Sede": row["Sede"],
-                "Código": row["Código"], "Descripción": row["Descripción"],
-                "Detalle": f"Existencia {int(round(row['Existencia']))} · revisar origen y abastecer.",
-            })
-        elif row["Estado"] == "CRÍTICO — COMPRAR":
-            alerts.append({
-                "Tipo": "Stock crítico", "Severidad": "ALTA", "Sede": row["Sede"],
-                "Código": row["Código"], "Descripción": row["Descripción"],
-                "Detalle": f"Existencia {int(round(row['Existencia']))} · punto de reorden {int(row['Punto de Reorden'])}.",
-            })
-        elif row["Estado"] == "SOBRESTOCK — RETIRAR":
-            alerts.append({
-                "Tipo": "Sobrestock", "Severidad": "MEDIA", "Sede": row["Sede"],
-                "Código": row["Código"], "Descripción": row["Descripción"],
-                "Detalle": f"Retirar {int(round(row['Retiro Almacén']))} unidades.",
-            })
-        if row["Sin movimiento"] == "Sí" and row["Existencia"] > 0:
-            alerts.append({
-                "Tipo": "Sin movimiento", "Severidad": "MEDIA", "Sede": row["Sede"],
-                "Código": row["Código"], "Descripción": row["Descripción"],
-                "Detalle": f"Hay {int(round(row['Existencia']))} unidades sin venta en el corte.",
-            })
-        if row["Tiene costo"] == "No":
-            alerts.append({
-                "Tipo": "Costo faltante", "Severidad": "BAJA", "Sede": row["Sede"],
-                "Código": row["Código"], "Descripción": row["Descripción"],
-                "Detalle": "Costo unitario no disponible; el análisis financiero puede estar subestimado.",
-            })
-    return pd.DataFrame(alerts, columns=["Tipo", "Severidad", "Sede", "Código", "Descripción", "Detalle"])
+
+    base_cols = ["Sede", "Código", "Descripción"]
+    pieces = []
+
+    m = df["Estado"] == "CRÍTICO — SALDO NEGATIVO"
+    if m.any():
+        sub = df.loc[m, base_cols].copy()
+        sub["Tipo"] = "Saldo negativo"
+        sub["Severidad"] = "CRÍTICA"
+        sub["Detalle"] = "Existencia " + df.loc[m, "Existencia"].round().astype(int).astype(str) + " · revisar origen y abastecer."
+        pieces.append(sub)
+
+    m = df["Estado"] == "CRÍTICO — COMPRAR"
+    if m.any():
+        sub = df.loc[m, base_cols].copy()
+        sub["Tipo"] = "Stock crítico"
+        sub["Severidad"] = "ALTA"
+        sub["Detalle"] = (
+            "Existencia " + df.loc[m, "Existencia"].round().astype(int).astype(str)
+            + " · punto de reorden " + df.loc[m, "Punto de Reorden"].astype(int).astype(str) + "."
+        )
+        pieces.append(sub)
+
+    m = df["Estado"] == "SOBRESTOCK — RETIRAR"
+    if m.any():
+        sub = df.loc[m, base_cols].copy()
+        sub["Tipo"] = "Sobrestock"
+        sub["Severidad"] = "MEDIA"
+        sub["Detalle"] = "Retirar " + df.loc[m, "Retiro Almacén"].round().astype(int).astype(str) + " unidades."
+        pieces.append(sub)
+
+    m = (df["Sin movimiento"] == "Sí") & (df["Existencia"] > 0)
+    if m.any():
+        sub = df.loc[m, base_cols].copy()
+        sub["Tipo"] = "Sin movimiento"
+        sub["Severidad"] = "MEDIA"
+        sub["Detalle"] = "Hay " + df.loc[m, "Existencia"].round().astype(int).astype(str) + " unidades sin venta en el corte."
+        pieces.append(sub)
+
+    m = df["Tiene costo"] == "No"
+    if m.any():
+        sub = df.loc[m, base_cols].copy()
+        sub["Tipo"] = "Costo faltante"
+        sub["Severidad"] = "BAJA"
+        sub["Detalle"] = "Costo unitario no disponible; el análisis financiero puede estar subestimado."
+        pieces.append(sub)
+
+    if not pieces:
+        return pd.DataFrame(columns=["Tipo", "Severidad", "Sede", "Código", "Descripción", "Detalle"])
+
+    result = pd.concat(pieces, ignore_index=True)
+    return result[["Tipo", "Severidad", "Sede", "Código", "Descripción", "Detalle"]]
 
 
 # ============================================================
@@ -1332,6 +1374,7 @@ def post_webhook(url: str, payload: dict[str, Any]) -> tuple[bool, str]:
 # EXCEL PREMIUM
 # ============================================================
 
+@st.cache_data(show_spinner=False)
 def export_excel(
     site_results: dict[str, pd.DataFrame],
     transfers: pd.DataFrame,
@@ -1575,6 +1618,10 @@ with st.sidebar:
     latest_global = dates[0] if dates else None
     status = f"● {latest_global}" if latest_global else "● Sin cortes"
     st.markdown(f'<span class="badge badge-green">{status}</span>', unsafe_allow_html=True)
+    if st.button("🔄 Forzar recálculo", use_container_width=True, help="Limpia la caché interna y recalcula todo desde cero. Útil si editaste datos manualmente en la base."):
+        st.cache_data.clear()
+        st.toast("Caché limpiada · recalculando todo", icon="🔄")
+        st.rerun()
     st.caption(f"NEXUS v{APP_VERSION} · SQLite local")
 
 
@@ -1624,6 +1671,22 @@ def load_live_results(
     return results, dates_used
 
 
+@st.cache_data(show_spinner=False)
+def build_dashboard_state(
+    site_results: dict[str, pd.DataFrame],
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
+    """Agrupa redistribución + ajuste + combinación + alertas en una sola
+    función cacheada. Así, si `site_results` no cambió (no hay corte nuevo
+    ni cambio de parámetros del motor), NEXUS no vuelve a correr estos
+    cálculos en cada clic dentro de la app — solo se recalculan cuando
+    realmente hay datos nuevos."""
+    transfers = build_redistribution(site_results)
+    site_results_adjusted = apply_redistribution_to_results(site_results, transfers)
+    all_df = combine_sites(site_results_adjusted)
+    alerts = build_alerts(all_df)
+    return transfers, site_results_adjusted, all_df, alerts
+
+
 site_results, dates_used = load_live_results(
     db_version(),
     int(months_history),
@@ -1635,11 +1698,7 @@ site_results, dates_used = load_live_results(
     sales_mode,
     int(rolling_days),
 )
-raw_all = combine_sites(site_results)
-transfers = build_redistribution(site_results)
-site_results_adjusted = apply_redistribution_to_results(site_results, transfers)
-all_df = combine_sites(site_results_adjusted)
-alerts = build_alerts(all_df)
+transfers, site_results_adjusted, all_df, alerts = build_dashboard_state(site_results)
 
 
 # ============================================================
