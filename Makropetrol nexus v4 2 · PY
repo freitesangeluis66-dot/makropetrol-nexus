@@ -31,6 +31,7 @@ import json
 import re
 import sqlite3
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,18 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
+
+# Tema global NEXUS: evita plantillas heredadas que puedan serializar colores
+# negros al exportar HTML y mantiene una identidad visual consistente.
+NEXUS_BLUE = "#3568F5"
+NEXUS_BLUE_2 = "#244BD7"
+NEXUS_CYAN = "#17AABE"
+NEXUS_GREEN = "#14A36A"
+NEXUS_ORANGE = "#EF982D"
+NEXUS_RED = "#DF5555"
+NEXUS_GRAY = "#7B8799"
+NEXUS_PALETTE = [NEXUS_BLUE, NEXUS_CYAN, NEXUS_GREEN, NEXUS_ORANGE, NEXUS_RED, NEXUS_BLUE_2, NEXUS_GRAY]
+pio.templates.default = "plotly_white"
 
 # Motor de lectura Excel acelerado. Si python-calamine no está instalado,
 # NEXUS sigue funcionando normalmente con el motor por defecto de pandas.
@@ -99,6 +112,9 @@ DEFAULT_CONTACTS = {
     }
     for site in SEDES
 }
+
+# Executor pequeño para no congelar la UI durante un webhook externo.
+WEBHOOK_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nexus-webhook")
 
 
 # ============================================================
@@ -247,12 +263,14 @@ def kpi(label: str, value: str, note: str = "", tone: str = "blue") -> None:
 
 def chart_layout(fig: go.Figure, height: int = 330) -> go.Figure:
     fig.update_layout(
+        template="plotly_white",
         height=height,
         margin=dict(l=10, r=10, t=42, b=10),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="DM Sans", color="#59677b"),
         legend=dict(orientation="h", y=1.03, x=0),
+        hoverlabel=dict(bgcolor="white", font_size=13, font_family="DM Sans"),
     )
     return fig
 
@@ -304,17 +322,17 @@ def build_interactive_html_report(
         Retiros=("Retiro Almacén", lambda x: int((x > 0).sum())),
     ).reset_index()
 
-    fig1 = px.bar(site_summary, x="Sede", y="Inventario", title="Valor de inventario por sede")
-    fig2 = px.bar(site_summary, x="Sede", y=["Compras", "Retiros"], barmode="group", title="Acciones por sede")
+    fig1 = px.bar(site_summary, x="Sede", y="Inventario", title="Valor de inventario por sede", color="Sede", color_discrete_sequence=NEXUS_PALETTE)
+    fig2 = px.bar(site_summary, x="Sede", y=["Compras", "Retiros"], barmode="group", title="Acciones por sede", color_discrete_sequence=[NEXUS_ORANGE, NEXUS_BLUE])
     state = all_df["Estado"].value_counts().reset_index()
     state.columns = ["Estado", "Cantidad"]
-    fig3 = px.pie(state, names="Estado", values="Cantidad", hole=.62, title="Distribución del estado logístico")
+    fig3 = px.pie(state, names="Estado", values="Cantidad", hole=.62, title="Distribución del estado logístico", color="Estado", color_discrete_map={"ÓPTIMO":NEXUS_GREEN,"CRÍTICO — SALDO NEGATIVO":NEXUS_RED,"CRÍTICO — COMPRAR":NEXUS_ORANGE,"SOBRESTOCK — RETIRAR":NEXUS_BLUE})
 
     top = all_df[all_df["Capital Inmovilizado ($)"] > 0].sort_values("Capital Inmovilizado ($)", ascending=False).head(12)
-    fig4 = px.bar(top.sort_values("Capital Inmovilizado ($)"), x="Capital Inmovilizado ($)", y="Descripción", orientation="h", title="Top capital inmovilizado") if not top.empty else None
+    fig4 = px.bar(top.sort_values("Capital Inmovilizado ($)"), x="Capital Inmovilizado ($)", y="Descripción", orientation="h", title="Top capital inmovilizado", color_discrete_sequence=[NEXUS_RED]) if not top.empty else None
 
     def fig_html(fig):
-        return pio.to_html(fig, full_html=False, include_plotlyjs=False)
+        return pio.to_html(fig, full_html=False, include_plotlyjs="inline", config={"responsive": True, "displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]})
 
     exec_df = build_executive_frame(all_df).head(40)
     alert_html = alerts.head(30).to_html(index=False, classes="dataframe") if not alerts.empty else "<p>Sin alertas.</p>"
@@ -340,7 +358,7 @@ body{{margin:0;background:#f4f7fb;color:#172137;font-family:Inter,Segoe UI,Arial
 .dataframe{{width:100%;border-collapse:collapse;font-size:12px}} .dataframe th{{background:#3568f5;color:#fff;padding:9px;text-align:left}} .dataframe td{{padding:8px;border-bottom:1px solid #e5eaf1}} .dataframe tr:nth-child(even){{background:#f9fbfd}}
 @media(max-width:900px){{.kpis,.grid{{grid-template-columns:1fr 1fr}}}} @media(max-width:600px){{.kpis,.grid{{grid-template-columns:1fr}} .wrap{{padding:18px}}}}
 </style>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
 </head>
 <body><div class="wrap">
 <div class="hero"><div class="brand">MAKROPETROL <span>NEXUS</span></div>
@@ -593,6 +611,16 @@ def init_db() -> None:
         con.commit()
 
 
+def reset_database() -> None:
+    """Borra absolutamente todos los datos guardados en SQLite para empezar de cero."""
+    with db() as con:
+        con.execute("DELETE FROM inventory_snapshots")
+        con.execute("DELETE FROM sales_snapshots")
+        con.execute("DELETE FROM processing_log")
+        con.commit()
+    st.cache_data.clear()
+
+
 def db_version() -> str:
     with db() as con:
         row = con.execute(
@@ -639,34 +667,32 @@ def save_snapshot(
     inventory: pd.DataFrame,
     sales: pd.DataFrame,
 ) -> None:
-    # Bulk insert vectorizado: se arma la tabla completa con pandas/numpy
-    # (columnas ya alineadas al esquema de SQLite) y se convierte a tuplas
-    # en un solo paso con itertuples, en vez de reconstruir fila a fila con
-    # getattr. Mantiene el esquema limpio (code/description/... en inglés)
-    # sin depender de to_sql, que no resuelve el mapeo de nombres por sí solo.
-    inv = inventory.copy()
-    sal = sales.copy()
+    """Guarda un corte con inserción masiva de pandas -> SQLite."""
+    inv = inventory
+    sal = sales
 
     inv_shaped = pd.DataFrame({
         "snapshot_date": snapshot_date,
         "site": site,
-        "code": inv.get("Código", "").astype(str),
-        "description": inv.get("Descripción", "").fillna("").astype(str) if "Descripción" in inv.columns else "",
-        "existence": pd.to_numeric(inv.get("Existencia", 0), errors="coerce").fillna(0.0),
-        "cost": pd.to_numeric(inv.get("Costo", 0), errors="coerce").fillna(0.0),
-        "supplier": inv.get("Proveedor", "").fillna("").astype(str) if "Proveedor" in inv.columns else "",
-        "category": inv.get("Categoría", "").fillna("").astype(str) if "Categoría" in inv.columns else "",
+        "code": inv.get("Código", pd.Series("", index=inv.index)).astype(str),
+        "description": inv.get("Descripción", pd.Series("", index=inv.index)).fillna("").astype(str)
+        if "Descripción" in inv.columns else "",
+        "existence": pd.to_numeric(inv.get("Existencia", pd.Series(0, index=inv.index)), errors="coerce").fillna(0.0),
+        "cost": pd.to_numeric(inv.get("Costo", pd.Series(0, index=inv.index)), errors="coerce").fillna(0.0),
+        "supplier": inv.get("Proveedor", pd.Series("", index=inv.index)).fillna("").astype(str)
+        if "Proveedor" in inv.columns else "",
+        "category": inv.get("Categoría", pd.Series("", index=inv.index)).fillna("").astype(str)
+        if "Categoría" in inv.columns else "",
     })
-    inv_records = list(inv_shaped.itertuples(index=False, name=None))
 
     sal_shaped = pd.DataFrame({
         "snapshot_date": snapshot_date,
         "site": site,
-        "code": sal.get("Código", "").astype(str),
-        "description": sal.get("Descripción", "").fillna("").astype(str) if "Descripción" in sal.columns else "",
-        "sales": pd.to_numeric(sal.get("Ventas", 0), errors="coerce").fillna(0.0),
+        "code": sal.get("Código", pd.Series("", index=sal.index)).astype(str),
+        "description": sal.get("Descripción", pd.Series("", index=sal.index)).fillna("").astype(str)
+        if "Descripción" in sal.columns else "",
+        "sales": pd.to_numeric(sal.get("Ventas", pd.Series(0, index=sal.index)), errors="coerce").fillna(0.0),
     })
-    sal_records = list(sal_shaped.itertuples(index=False, name=None))
 
     with db() as con:
         con.execute(
@@ -677,27 +703,39 @@ def save_snapshot(
             "DELETE FROM sales_snapshots WHERE site=? AND snapshot_date=?",
             (site, snapshot_date),
         )
-        con.executemany(
-            "INSERT INTO inventory_snapshots VALUES (?,?,?,?,?,?,?,?)",
-            inv_records,
-        )
-        con.executemany(
-            "INSERT INTO sales_snapshots VALUES (?,?,?,?,?)",
-            sal_records,
-        )
+
+        if not inv_shaped.empty:
+            inv_shaped.to_sql(
+                "inventory_snapshots",
+                con,
+                if_exists="append",
+                index=False,
+                method="multi",
+                chunksize=5000,
+            )
+
+        if not sal_shaped.empty:
+            sal_shaped.to_sql(
+                "sales_snapshots",
+                con,
+                if_exists="append",
+                index=False,
+                method="multi",
+                chunksize=5000,
+            )
+
         con.execute(
             "INSERT INTO processing_log(processed_at,snapshot_date,site,inventory_rows,sales_rows) VALUES(?,?,?,?,?)",
             (
                 datetime.now().isoformat(timespec="seconds"),
                 snapshot_date,
                 site,
-                len(inv_records),
-                len(sal_records),
+                len(inv_shaped),
+                len(sal_shaped),
             ),
         )
         con.commit()
 
-    # Limpia caché porque cambió la fuente de verdad.
     st.cache_data.clear()
 
 
@@ -831,7 +869,7 @@ def parse_uploaded_excel(raw_bytes: bytes, kind: str) -> tuple[pd.DataFrame, int
 
 def downcast_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Reduce el uso de memoria de forma segura: solo columnas categóricas
-    de baja cardinalidad y enteros que realmente caben en tipos chicos.
+    de baja cardinalidad y enteros que realmente caben en chicos chicos.
     No se toca nada indiscriminadamente para no perder precisión."""
     if df.empty:
         return df
@@ -842,6 +880,18 @@ def downcast_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns and df[col].dtype == object:
             if df[col].nunique(dropna=False) < max(50, len(df) // 2):
                 df[col] = df[col].astype("category")
+
+    integer_like = [
+        "Ventas", "Demanda Mensual", "Existencia", "Stock Mínimo", "Stock Máximo",
+        "Demanda Lead Time", "Stock Seguridad", "Punto de Reorden",
+        "Compra Sugerida", "Retiro Almacén", "Compra Ajustada",
+        "Transferencias Recibidas", "Transferencias Enviadas",
+    ]
+    for col in integer_like:
+        if col in df.columns:
+            s = pd.to_numeric(df[col], errors="coerce")
+            if s.notna().all():
+                df[col] = pd.to_numeric(s.round(), downcast="integer")
     return df
 
 
@@ -1362,12 +1412,19 @@ def post_webhook(url: str, payload: dict[str, Any]) -> tuple[bool, str]:
     if not url.strip():
         return False, "Webhook vacío"
     try:
-        r = requests.post(url.strip(), json=payload, timeout=15)
+        r = requests.post(url.strip(), json=payload, timeout=8)
         if 200 <= r.status_code < 300:
             return True, f"HTTP {r.status_code}"
         return False, f"HTTP {r.status_code}: {r.text[:180]}"
     except Exception as exc:
         return False, str(exc)
+
+
+def post_webhook_async(url: str, payload: dict[str, Any]):
+    """Dispara el webhook en segundo plano para no congelar la UI."""
+    if not url.strip():
+        return None
+    return WEBHOOK_EXECUTOR.submit(post_webhook, url, payload)
 
 
 # ============================================================
@@ -1622,6 +1679,17 @@ with st.sidebar:
         st.cache_data.clear()
         st.toast("Caché limpiada · recalculando todo", icon="🔄")
         st.rerun()
+
+    # --- NUEVO BOTÓN DE RESETEO TOTAL ---
+    with st.expander("⚠️ Resetear Sistema"):
+        st.warning("Borrará todo el historial y cortes guardados. Útil si te equivocaste de archivo.")
+        if st.button("🗑️ Borrar Base de Datos", use_container_width=True, type="primary"):
+            reset_database()
+            st.session_state.clear()
+            st.toast("Sistema reiniciado a cero exitosamente.", icon="✅")
+            st.rerun()
+    # ------------------------------------
+
     st.caption(f"NEXUS v{APP_VERSION} · SQLite local")
 
 
@@ -1720,6 +1788,247 @@ st.markdown(
 )
 
 
+def _inventory_column_config(data: pd.DataFrame) -> dict[str, Any]:
+    cfg: dict[str, Any] = {}
+    if "Cobertura (meses)" in data.columns:
+        cfg["Cobertura (meses)"] = st.column_config.NumberColumn(
+            "Cobertura", format="%.1f meses", width="small"
+        )
+    if "Retiro Almacén" in data.columns and not data.empty:
+        cfg["Retiro Almacén"] = st.column_config.ProgressColumn(
+            "Retiro", min_value=0,
+            max_value=max(1, int(pd.to_numeric(data["Retiro Almacén"], errors="coerce").max())),
+            format="%d uds",
+        )
+    if "Compra Ajustada" in data.columns and not data.empty:
+        cfg["Compra Ajustada"] = st.column_config.ProgressColumn(
+            "Compra neta", min_value=0,
+            max_value=max(1, int(pd.to_numeric(data["Compra Ajustada"], errors="coerce").max())),
+            format="%d uds",
+        )
+    return cfg
+
+
+@st.fragment
+def render_inventario_fragment(all_df: pd.DataFrame, modo_gerencia: bool) -> None:
+    if all_df.empty:
+        empty_state("Sin inventario", "Procesa al menos una sede desde Cortes Diarios.", "📦")
+        return
+
+    s = st.selectbox("Sede", ["Todas"] + sorted(all_df["Sede"].unique()), key="inv_site_filter")
+    data = all_df if s == "Todas" else all_df[all_df["Sede"] == s]
+
+    search = st.text_input(
+        "Buscar código o descripción",
+        placeholder="Ej. TMB03 / ACEITE / FILTRO",
+        key="inv_search",
+    )
+    if search:
+        q = normalize_text(search)
+        data = data[
+            data["Código"].astype(str).str.lower().str.contains(q, na=False)
+            | data["Descripción"].astype(str).str.lower().str.contains(q, na=False)
+        ]
+
+    state_options = sorted(data["Estado"].astype(str).unique())
+    states = st.multiselect("Estado", state_options, default=state_options, key="inv_states")
+    data = data[data["Estado"].astype(str).isin(states)]
+
+    purchase_col = "Compra Ajustada" if "Compra Ajustada" in data.columns else "Compra Sugerida"
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: kpi("Productos", integer(len(data)), "Filtrados", "blue")
+    with c2: kpi("Críticos", integer(data["Estado"].astype(str).str.startswith("CRÍTICO").sum()), "Atención", "red")
+    with c3: kpi("Compras", integer(data[purchase_col].sum()), "Unidades", "orange")
+    with c4: kpi("Sobrestock", integer(data["Retiro Almacén"].sum()), "Unidades", "green")
+
+    if modo_gerencia:
+        cols = ["Sede", "Código", "Descripción", "ABC", "Estado", "Prioridad", "Acción",
+                purchase_col, "Retiro Almacén", "Cobertura (meses)",
+                "Valor Inventario ($)", "Capital Inmovilizado ($)"]
+    else:
+        cols = ["Sede", "Código", "Descripción", "Proveedor", "Categoría", "ABC", "Estado",
+                "Prioridad", "Acción", "Ventas", "Demanda Mensual", "Existencia",
+                "Stock Mínimo", "Stock Máximo", "Punto de Reorden", purchase_col,
+                "Retiro Almacén", "Cobertura (meses)", "Rotación estimada (x/mes)",
+                "Valor Inventario ($)", "Capital Inmovilizado ($)"]
+
+    cols = [c for c in cols if c in data.columns]
+    shown = data[cols].head(750)
+    cfg = _inventory_column_config(shown)
+    for c in ["Valor Inventario ($)", "Capital Inmovilizado ($)"]:
+        if c in shown.columns:
+            cfg[c] = st.column_config.NumberColumn(c, format="$%.2f")
+    if "Prioridad" in shown.columns:
+        cfg["Prioridad"] = st.column_config.TextColumn("Prioridad", width="small")
+    if "Descripción" in shown.columns:
+        cfg["Descripción"] = st.column_config.TextColumn("Descripción", width="large")
+
+    st.dataframe(
+        shown,
+        use_container_width=True,
+        hide_index=True,
+        height=620,
+        column_config=cfg,
+    )
+    if len(data) > len(shown):
+        st.caption(f"Mostrando {len(shown):,} de {len(data):,} registros. La exportación conserva el 100% de los datos.")
+
+
+@st.fragment
+def render_compras_fragment(all_df: pd.DataFrame, modo_gerencia: bool) -> None:
+    if all_df.empty:
+        empty_state("Sin plan de compras", "Carga un corte diario para calcular necesidades.", "🛒")
+        return
+    purchase_col = "Compra Ajustada" if "Compra Ajustada" in all_df.columns else "Compra Sugerida"
+    data = all_df[all_df[purchase_col] > 0]
+    if data.empty:
+        st.success("No existen compras pendientes después de considerar redistribuciones.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1: kpi("SKUs a comprar", integer(len(data)), "Compra neta", "orange")
+    with c2: kpi("Unidades", integer(data[purchase_col].sum()), "Necesidad neta", "blue")
+    with c3: kpi("Costo estimado", money((data[purchase_col] * data["Costo"]).sum()), "Costo disponible", "green")
+
+    a, b = st.columns(2)
+    with a:
+        sites_filter = st.multiselect("Sedes", sorted(data["Sede"].unique()), default=sorted(data["Sede"].unique()), key="purchase_sites")
+    with b:
+        priorities = st.multiselect("Prioridad", sorted(data["Prioridad"].unique()), default=sorted(data["Prioridad"].unique()), key="purchase_priorities")
+    data = data[data["Sede"].isin(sites_filter) & data["Prioridad"].isin(priorities)]
+
+    if modo_gerencia:
+        cols = ["Sede", "Código", "Descripción", "Proveedor", purchase_col, "Costo Compra Estimada ($)", "Prioridad", "Acción"]
+    else:
+        cols = ["Sede", "Código", "Descripción", "Proveedor", "ABC", "Ventas", "Existencia",
+                "Punto de Reorden", purchase_col, "Costo", "Costo Compra Estimada ($)", "Prioridad", "Acción"]
+    cols = [c for c in cols if c in data.columns]
+
+    cfg = {
+        "Costo": st.column_config.NumberColumn("Costo", format="$%.2f"),
+        "Costo Compra Estimada ($)": st.column_config.NumberColumn("Costo estimado", format="$%.2f"),
+    }
+    if purchase_col in data.columns and not data.empty:
+        cfg[purchase_col] = st.column_config.ProgressColumn(
+            "Compra neta", min_value=0,
+            max_value=max(1, int(data[purchase_col].max())),
+            format="%d uds",
+        )
+    st.dataframe(data[cols].head(750), use_container_width=True, hide_index=True, height=580, column_config=cfg)
+    if len(data) > 750:
+        st.caption(f"Mostrando 750 de {len(data):,} registros. La exportación conserva todos.")
+
+    supplier = data.groupby("Proveedor", dropna=False)[purchase_col].sum().reset_index().sort_values(purchase_col, ascending=False).head(10)
+    fig = px.bar(
+        supplier, x=purchase_col, y="Proveedor", orientation="h",
+        title="Top proveedores por unidades a comprar",
+        color_discrete_sequence=[NEXUS_ORANGE],
+    )
+    st.plotly_chart(chart_layout(fig, 320), use_container_width=True)
+
+
+@st.fragment
+def render_alertas_fragment(alerts: pd.DataFrame) -> None:
+    if alerts.empty:
+        empty_state("Todo tranquilo", "No se detectaron anomalías con los parámetros actuales.", "✓")
+        return
+    sev = st.multiselect("Severidad", sorted(alerts["Severidad"].unique()), default=sorted(alerts["Severidad"].unique()), key="alert_sev")
+    typ = st.multiselect("Tipo", sorted(alerts["Tipo"].unique()), default=sorted(alerts["Tipo"].unique()), key="alert_type")
+    data = alerts[alerts["Severidad"].isin(sev) & alerts["Tipo"].isin(typ)]
+    counts = data["Severidad"].value_counts().reset_index()
+    counts.columns = ["Severidad", "Cantidad"]
+    fig = px.bar(
+        counts, x="Severidad", y="Cantidad",
+        title="Alertas por severidad",
+        color="Severidad",
+        color_discrete_map={"CRÍTICA": NEXUS_RED, "ALTA": NEXUS_ORANGE, "MEDIA": NEXUS_BLUE, "BAJA": NEXUS_GRAY},
+    )
+    st.plotly_chart(chart_layout(fig, 280), use_container_width=True)
+    st.dataframe(data.head(750), use_container_width=True, hide_index=True, height=580)
+    if len(data) > 750:
+        st.caption(f"Mostrando 750 de {len(data):,} alertas.")
+
+
+@st.fragment
+def render_automation_fragment(
+    site_results_adjusted: dict[str, pd.DataFrame],
+    transfers: pd.DataFrame,
+    all_df: pd.DataFrame,
+    contacts: dict[str, dict[str, str]],
+) -> None:
+    contact_rows = []
+    for site in SEDES:
+        c = contacts.get(site, {})
+        contact_rows.append({
+            "Sede": site,
+            "Supervisor": c.get("supervisor", ""),
+            "WhatsApp": c.get("whatsapp", ""),
+            "Webhook": c.get("webhook", ""),
+        })
+    edited = st.data_editor(
+        pd.DataFrame(contact_rows),
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key="contacts_editor",
+    )
+    if st.button("💾 Guardar contactos y webhooks", use_container_width=True):
+        new_contacts = {}
+        for row in edited.to_dict("records"):
+            new_contacts[str(row["Sede"])] = {
+                "supervisor": str(row.get("Supervisor", "")),
+                "whatsapp": str(row.get("WhatsApp", "")),
+                "webhook": str(row.get("Webhook", "")),
+            }
+        save_contacts(new_contacts)
+        contacts.clear()
+        contacts.update(new_contacts)
+        st.toast("Contactos y webhooks guardados", icon="💾")
+
+    if all_df.empty:
+        empty_state("Automatización lista para conectar", "Configura los webhooks y procesa un corte diario.", "⚙")
+        return
+
+    site = st.selectbox("Sede a notificar", sorted(site_results_adjusted.keys()), key="automation_site")
+    message = compose_digest(site, site_results_adjusted[site], transfers)
+    st.code(message, language="text")
+
+    supervisor = contacts.get(site, {})
+    df_site = site_results_adjusted[site]
+    purchase_col = "Compra Ajustada" if "Compra Ajustada" in df_site.columns else "Compra Sugerida"
+    payload = {
+        "event": "nexus.daily.logistics",
+        "version": APP_VERSION,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "site": site,
+        "supervisor": supervisor.get("supervisor", ""),
+        "whatsapp": supervisor.get("whatsapp", ""),
+        "health_score": health_score(df_site),
+        "message": message,
+        "metrics": {
+            "critical": int(df_site["Estado"].astype(str).str.startswith("CRÍTICO").sum()),
+            "purchase_skus": int((df_site[purchase_col] > 0).sum()),
+            "purchase_units": int(df_site[purchase_col].sum()),
+            "withdrawal_skus": int((df_site["Retiro Almacén"] > 0).sum()),
+            "inventory_value": float(df_site["Valor Inventario ($)"].sum()),
+            "capital_immobilized": float(df_site["Capital Inmovilizado ($)"].sum()),
+        },
+    }
+
+    with st.expander("Vista técnica del payload", expanded=False):
+        st.json(payload)
+
+    if st.button("🚀 Enviar al webhook de esta sede", use_container_width=True):
+        future = post_webhook_async(supervisor.get("webhook", ""), payload)
+        if future is None:
+            st.error("No se envió: webhook vacío.")
+        else:
+            st.toast("Webhook disparado en segundo plano", icon="🚀")
+            st.session_state["last_webhook_site"] = site
+    st.info("Arquitectura: NEXUS → webhook → n8n/Make/API → CRM + proveedor de WhatsApp. El proveedor externo gestiona plantillas y reglas de envío.")
+
+
+
 # ============================================================
 # CENTRO DE CONTROL
 # ============================================================
@@ -1810,7 +2119,7 @@ if view == "Centro de Control":
                     "Acción": ["Óptimo", "Comprar", "Retirar", "Crítico"],
                     "Cantidad": [optimal, purchases, withdrawals, critical],
                 })
-                fig = px.pie(action_counts, names="Acción", values="Cantidad", hole=.68)
+                fig = px.pie(action_counts, names="Acción", values="Cantidad", hole=.68, color="Acción", color_discrete_map={"Óptimo":NEXUS_GREEN,"Comprar":NEXUS_ORANGE,"Retirar":NEXUS_BLUE,"Crítico":NEXUS_RED})
                 fig.update_traces(textposition="inside", textinfo="percent+label")
                 st.plotly_chart(chart_layout(fig, 300), use_container_width=True)
             with b:
@@ -1818,7 +2127,7 @@ if view == "Centro de Control":
                 if top.empty:
                     st.success("No existe capital inmovilizado por sobrestock.")
                 else:
-                    fig = px.bar(top.sort_values("Capital Inmovilizado ($)"), x="Capital Inmovilizado ($)", y="Descripción", orientation="h", hover_data=["Sede", "Código", "Retiro Almacén"])
+                    fig = px.bar(top.sort_values("Capital Inmovilizado ($)"), x="Capital Inmovilizado ($)", y="Descripción", orientation="h", hover_data=["Sede", "Código", "Retiro Almacén"], color_discrete_sequence=[NEXUS_RED])
                     st.plotly_chart(chart_layout(fig, 300), use_container_width=True)
         else:
             st.markdown('<div class="section-title">Recomendaciones para dirección</div>', unsafe_allow_html=True)
@@ -1932,7 +2241,7 @@ elif view == "Centro Visual":
         v1,v2 = st.columns(2)
         with v1:
             site = all_df.groupby("Sede")["Valor Inventario ($)"].sum().reset_index()
-            fig=px.bar(site,x="Sede",y="Valor Inventario ($)",title="Valor de inventario por sede")
+            fig=px.bar(site,x="Sede",y="Valor Inventario ($)",title="Valor de inventario por sede", color="Sede", color_discrete_sequence=NEXUS_PALETTE)
             st.plotly_chart(chart_layout(fig,360),use_container_width=True)
         with v2:
             act=pd.DataFrame({"Tipo":["Crítico","Comprar","Retirar","Óptimo"],"Cantidad":[len(critical_df),len(purchase_df),len(over_df),int((all_df["Estado"]=="ÓPTIMO").sum())]})
@@ -1957,74 +2266,7 @@ elif view == "Centro Visual":
 
 elif view == "Inventario":
     st.markdown('<div class="section-title">Explorador inteligente de inventario</div>', unsafe_allow_html=True)
-    if all_df.empty:
-        empty_state("Sin inventario", "Procesa al menos una sede desde Cortes Diarios.", "📦")
-    else:
-        s = st.selectbox("Sede", ["Todas"] + sorted(all_df["Sede"].unique()))
-        data = all_df.copy() if s == "Todas" else all_df[all_df["Sede"] == s].copy()
-        search = st.text_input("Buscar código o descripción", placeholder="Ej. TMB03 / ACEITE / FILTRO")
-        if search:
-            q = normalize_text(search)
-            data = data[
-                data["Código"].astype(str).str.lower().str.contains(q, na=False)
-                | data["Descripción"].astype(str).str.lower().str.contains(q, na=False)
-            ]
-        states = st.multiselect("Estado", sorted(data["Estado"].unique()), default=sorted(data["Estado"].unique()))
-        data = data[data["Estado"].isin(states)]
-        c1,c2,c3,c4 = st.columns(4)
-        purchase_col = "Compra Ajustada" if "Compra Ajustada" in data.columns else "Compra Sugerida"
-        with c1: kpi("Productos", integer(len(data)), "Filtrados", "blue")
-        with c2: kpi("Críticos", integer(data["Estado"].astype(str).str.startswith("CRÍTICO").sum()), "Atención", "red")
-        with c3: kpi("Compras", integer(data[purchase_col].sum()), "Unidades", "orange")
-        with c4: kpi("Sobrestock", integer(data["Retiro Almacén"].sum()), "Unidades", "green")
-
-        if modo_gerencia:
-            cols = ["Sede", "Código", "Descripción", "ABC", "Estado", "Acción", purchase_col, "Retiro Almacén", "Cobertura (meses)"]
-        else:
-            cols = ["Sede", "Código", "Descripción", "ABC", "Estado", "Prioridad", "Acción", "Ventas", "Existencia", "Stock Mínimo", "Stock Máximo", "Punto de Reorden", purchase_col, "Retiro Almacén", "Cobertura (meses)"]
-        cols = [c for c in cols if c in data.columns]
-
-        # Carga diferida: se muestran las primeras filas y un botón para ver
-        # todo. El archivo completo (sin límite) sigue disponible al exportar.
-        PAGE_SIZE = 300
-        st.session_state.setdefault("inv_show_all", False)
-        total_rows = len(data)
-        if total_rows > PAGE_SIZE and not st.session_state["inv_show_all"]:
-            shown = data[cols].head(PAGE_SIZE)
-            st.caption(f"Mostrando {PAGE_SIZE:,} de {total_rows:,} filas · usa la búsqueda/filtros para acotar, o carga el resto.")
-        else:
-            shown = data[cols]
-
-        inv_col_config: dict[str, Any] = {}
-        if "Cobertura (meses)" in shown.columns:
-            inv_col_config["Cobertura (meses)"] = st.column_config.NumberColumn(format="%.1f")
-        if purchase_col in shown.columns:
-            inv_col_config[purchase_col] = st.column_config.ProgressColumn(
-                "Compra", min_value=0, max_value=max(1, int(data[purchase_col].max())), format="%d uds"
-            )
-        if "Retiro Almacén" in shown.columns:
-            inv_col_config["Retiro Almacén"] = st.column_config.ProgressColumn(
-                "Retiro Almacén", min_value=0, max_value=max(1, int(data["Retiro Almacén"].max())), format="%d uds"
-            )
-        st.dataframe(
-            shown,
-            use_container_width=True,
-            hide_index=True,
-            height=620,
-            column_config=inv_col_config,
-        )
-        if total_rows > PAGE_SIZE and not st.session_state["inv_show_all"]:
-            if st.button(f"⬇ Cargar las {total_rows - PAGE_SIZE:,} filas restantes", use_container_width=True):
-                st.session_state["inv_show_all"] = True
-                st.rerun()
-
-        st.download_button(
-            "⬇ Exportar vista filtrada completa (CSV)",
-            export_csv_bytes(data[cols]),
-            "Inventario_Filtrado_Makropetrol.csv",
-            "text/csv",
-            use_container_width=True,
-        )
+    render_inventario_fragment(all_df, modo_gerencia)
 
 
 # ============================================================
@@ -2033,47 +2275,7 @@ elif view == "Inventario":
 
 elif view == "Compras":
     st.markdown('<div class="section-title">Centro de abastecimiento</div>', unsafe_allow_html=True)
-    if all_df.empty:
-        empty_state("Sin plan de compras", "Carga un corte diario para que NEXUS calcule las necesidades.", "🛒")
-    else:
-        purchase_col = "Compra Ajustada" if "Compra Ajustada" in all_df.columns else "Compra Sugerida"
-        data = all_df[all_df[purchase_col] > 0].copy()
-        if data.empty:
-            st.success("No existen compras pendientes después de considerar redistribuciones.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            with c1: kpi("SKUs a comprar", integer(len(data)), "Compra neta", "orange")
-            with c2: kpi("Unidades", integer(data[purchase_col].sum()), "Necesidad neta", "blue")
-            with c3: kpi("Costo estimado", money((data[purchase_col] * data["Costo"]).sum()), "Costo disponible", "green")
-
-            a, b = st.columns(2)
-            with a: sites_filter = st.multiselect("Sedes", sorted(data["Sede"].unique()), default=sorted(data["Sede"].unique()))
-            with b: priorities = st.multiselect("Prioridad", sorted(data["Prioridad"].unique()), default=sorted(data["Prioridad"].unique()))
-            data = data[data["Sede"].isin(sites_filter) & data["Prioridad"].isin(priorities)]
-
-            if modo_gerencia:
-                cols = ["Sede", "Código", "Descripción", "Proveedor", purchase_col, "Costo Compra Estimada ($)", "Prioridad"]
-            else:
-                cols = ["Sede", "Código", "Descripción", "Proveedor", "ABC", "Ventas", "Existencia", "Punto de Reorden", purchase_col, "Costo", "Costo Compra Estimada ($)", "Prioridad", "Acción"]
-            cols = [c for c in cols if c in data.columns]
-            st.dataframe(
-                data[cols],
-                use_container_width=True,
-                hide_index=True,
-                height=580,
-                column_config={
-                    "Costo": st.column_config.NumberColumn(format="$%.2f"),
-                    "Costo Compra Estimada ($)": st.column_config.NumberColumn(format="$%.2f"),
-                },
-            )
-            if "Proveedor" in data.columns:
-                supplier = data.groupby("Proveedor", dropna=False)[purchase_col].sum().reset_index().sort_values(purchase_col, ascending=False).head(10)
-                fig = px.bar(supplier, x=purchase_col, y="Proveedor", orientation="h", title="Top proveedores por unidades a comprar")
-                st.plotly_chart(chart_layout(fig, 320), use_container_width=True)
-
-            wb = io.BytesIO()
-            data[cols].to_excel(wb, index=False, sheet_name="Plan Compras")
-            st.download_button("⬇ Exportar plan de compras", wb.getvalue(), "Plan_Compras_Makropetrol.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    render_compras_fragment(all_df, modo_gerencia)
 
 
 # ============================================================
@@ -2151,11 +2353,11 @@ elif view == "Finanzas":
         a, b = st.columns(2)
         by_site = all_df.groupby("Sede")["Valor Inventario ($)"].sum().reset_index()
         with a:
-            fig = px.bar(by_site, x="Sede", y="Valor Inventario ($)", title="Valor de inventario por sede")
+            fig = px.bar(by_site, x="Sede", y="Valor Inventario ($)", title="Valor de inventario por sede", color="Sede", color_discrete_sequence=NEXUS_PALETTE)
             st.plotly_chart(chart_layout(fig), use_container_width=True)
         with b:
             by_site2 = all_df.groupby("Sede")["Capital Inmovilizado ($)"].sum().reset_index()
-            fig = px.bar(by_site2, x="Sede", y="Capital Inmovilizado ($)", title="Capital inmovilizado por sede")
+            fig = px.bar(by_site2, x="Sede", y="Capital Inmovilizado ($)", title="Capital inmovilizado por sede", color="Sede", color_discrete_sequence=NEXUS_PALETTE)
             st.plotly_chart(chart_layout(fig), use_container_width=True)
         st.markdown('<div class="section-title">Capital inmovilizado por producto</div>', unsafe_allow_html=True)
         financial = all_df[all_df["Capital Inmovilizado ($)"] > 0].sort_values("Capital Inmovilizado ($)", ascending=False).head(100)
@@ -2181,17 +2383,7 @@ elif view == "Finanzas":
 
 elif view == "Alertas":
     st.markdown('<div class="section-title">Centro de alertas</div>', unsafe_allow_html=True)
-    if alerts.empty:
-        empty_state("Todo tranquilo", "No se detectaron anomalías con los parámetros actuales.", "✓")
-    else:
-        sev = st.multiselect("Severidad", sorted(alerts["Severidad"].unique()), default=sorted(alerts["Severidad"].unique()))
-        typ = st.multiselect("Tipo", sorted(alerts["Tipo"].unique()), default=sorted(alerts["Tipo"].unique()))
-        data = alerts[alerts["Severidad"].isin(sev) & alerts["Tipo"].isin(typ)]
-        counts = data["Severidad"].value_counts().reset_index()
-        counts.columns = ["Severidad", "Cantidad"]
-        fig = px.bar(counts, x="Severidad", y="Cantidad", title="Alertas por severidad")
-        st.plotly_chart(chart_layout(fig, 280), use_container_width=True)
-        st.dataframe(data, use_container_width=True, hide_index=True, height=580)
+    render_alertas_fragment(alerts)
 
 
 # ============================================================
@@ -2200,66 +2392,8 @@ elif view == "Alertas":
 
 elif view == "Automatización":
     st.markdown('<div class="section-title">Hub de automatización</div>', unsafe_allow_html=True)
-    st.caption("El ERP genera payloads para conectarse con tu CRM y tu proveedor de WhatsApp por webhook. Así puedes orquestar avisos, tickets, pedidos y flujos externos sin meter credenciales dentro del código.")
-
-    contact_rows = []
-    for site in SEDES:
-        c = contacts.get(site, {})
-        contact_rows.append({
-            "Sede": site,
-            "Supervisor": c.get("supervisor", ""),
-            "WhatsApp": c.get("whatsapp", ""),
-            "Webhook": c.get("webhook", ""),
-        })
-    edited = st.data_editor(pd.DataFrame(contact_rows), use_container_width=True, hide_index=True, num_rows="fixed", key="contacts_editor")
-    if st.button("💾 Guardar contactos y webhooks", use_container_width=True):
-        new_contacts = {}
-        for row in edited.to_dict("records"):
-            new_contacts[str(row["Sede"])] = {
-                "supervisor": str(row.get("Supervisor", "")),
-                "whatsapp": str(row.get("WhatsApp", "")),
-                "webhook": str(row.get("Webhook", "")),
-            }
-        contacts = new_contacts
-        save_contacts(contacts)
-        st.toast("Contactos y webhooks guardados", icon="💾")
-
-    if all_df.empty:
-        empty_state("Automatización lista para conectar", "Configura los webhooks y procesa un corte diario para generar mensajes y payloads.", "⚙")
-    else:
-        st.markdown('<div class="section-title">Envío por sede</div>', unsafe_allow_html=True)
-        site = st.selectbox("Sede a notificar", sorted(site_results.keys()))
-        message = compose_digest(site, site_results_adjusted[site], transfers)
-        st.code(message, language="text")
-
-        supervisor = contacts.get(site, {})
-        payload = {
-            "event": "nexus.daily.logistics",
-            "version": APP_VERSION,
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "site": site,
-            "supervisor": supervisor.get("supervisor", ""),
-            "whatsapp": supervisor.get("whatsapp", ""),
-            "health_score": health_score(site_results_adjusted[site]),
-            "message": message,
-            "metrics": {
-                "critical": int(site_results_adjusted[site]["Estado"].str.startswith("CRÍTICO").sum()),
-                "purchase_skus": int((site_results_adjusted[site].get("Compra Ajustada", site_results_adjusted[site]["Compra Sugerida"]) > 0).sum()),
-                "withdrawal_skus": int((site_results_adjusted[site]["Retiro Almacén"] > 0).sum()),
-                "inventory_value": float(site_results_adjusted[site]["Valor Inventario ($)"].sum()),
-                "capital_immobilized": float(site_results_adjusted[site]["Capital Inmovilizado ($)"].sum()),
-            },
-        }
-
-        st.json(payload)
-        if st.button("🚀 Enviar al webhook de esta sede", use_container_width=True):
-            ok, detail = post_webhook(supervisor.get("webhook", ""), payload)
-            if ok:
-                st.toast(f"Webhook enviado · {detail}", icon="🚀")
-            else:
-                st.error(f"No se envió · {detail}")
-
-        st.info("Arquitectura recomendada: NEXUS → webhook → n8n/Make/tu API → CRM + proveedor WhatsApp. El proveedor de WhatsApp decide el formato, plantillas y reglas de envío.")
+    st.caption("El ERP genera payloads para CRM, n8n/Make y WhatsApp por webhook.")
+    render_automation_fragment(site_results_adjusted, transfers, all_df, contacts)
 
 
 # ============================================================
@@ -2285,7 +2419,7 @@ elif view == "Historial":
 
 elif view == "Exportación de Datos":
     st.markdown('<div class="section-title">Centro de exportación y presentación</div>', unsafe_allow_html=True)
-    st.caption("Elige cómo quieres consumir la información: Excel operativo, Excel gerencial, HTML interactivo, PDF ejecutivo, CSV o JSON.")
+    st.caption("Elige cómo quieres consumir la información: Excel operativo, Excel gerencial, HTML autocontenido e interactivo, PDF ejecutivo, CSV o JSON. El dashboard HTML ya no depende de un CDN externo para sus gráficos.")
     if all_df.empty:
         empty_state("Nada que exportar", "Carga y procesa al menos un corte diario.", "📭")
     else:
