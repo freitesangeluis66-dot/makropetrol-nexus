@@ -1,8 +1,8 @@
-streamlit>=1.38
-pandas>=2.0
-numpy>=1.24
-openpyxl>=3.1
-plotly>=5.20
-requests>=2.31
-python-calamine>=0.2
-fpdf2>=2.7
+streamlit
+pandas
+numpy
+openpyxl
+plotly
+requests
+python-calamine
+fpdf2
