@@ -1,8 +1,9 @@
-streamlit
-pandas
-numpy
-openpyxl
-plotly
-requests
-python-calamine
-fpdf2
+streamlit==1.63.0
+pandas==2.2.3
+numpy==2.3.5
+plotly==6.9.0
+openpyxl==3.1.5
+requests==2.34.2
+python-calamine==0.8.2
+xlrd==2.0.1
+fpdf2==2.8.8
